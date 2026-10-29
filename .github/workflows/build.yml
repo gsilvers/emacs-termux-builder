@@ -13,6 +13,10 @@ on:
         description: "Termux app tag (e.g. v0.118.3); empty = latest release"
         required: false
         default: ""
+      ghostel_tag:
+        description: "Ghostel tag (e.g. v0.60.0); empty = latest release"
+        required: false
+        default: ""
       publish:
         description: "Publish a GitHub release (off = test build, APKs kept as a workflow artifact)"
         type: boolean
@@ -47,6 +51,8 @@ jobs:
       emacs_commit: ${{ steps.v.outputs.emacs_commit }}
       termux_tag: ${{ steps.v.outputs.termux_tag }}
       termux_commit: ${{ steps.v.outputs.termux_commit }}
+      ghostel_tag: ${{ steps.v.outputs.ghostel_tag }}
+      ghostel_commit: ${{ steps.v.outputs.ghostel_commit }}
       release_tag: ${{ steps.v.outputs.release_tag }}
       build: ${{ steps.v.outputs.build }}
       release: ${{ steps.v.outputs.release }}
@@ -56,6 +62,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           EMACS_TAG: ${{ inputs.emacs_tag }}
           TERMUX_TAG: ${{ inputs.termux_tag }}
+          GHOSTEL_TAG: ${{ inputs.ghostel_tag }}
           PUBLISH: ${{ inputs.publish }}
           FORCE: ${{ inputs.force }}
         run: |
@@ -71,14 +78,20 @@ jobs:
           if [ -z "$TERMUX_TAG" ]; then
             TERMUX_TAG=$(gh api repos/termux/termux-app/releases/latest -q .tag_name)
           fi
+          if [ -z "$GHOSTEL_TAG" ]; then
+            GHOSTEL_TAG=$(gh api repos/dakra/ghostel/releases/latest -q .tag_name)
+          fi
           emacs_commit=$(git ls-remote "$emacs_repo" "refs/tags/$EMACS_TAG^{}" "refs/tags/$EMACS_TAG" \
             | sort -k2 -r | head -1 | cut -f1)
           termux_commit=$(git ls-remote https://github.com/termux/termux-app "refs/tags/$TERMUX_TAG^{}" "refs/tags/$TERMUX_TAG" \
             | sort -k2 -r | head -1 | cut -f1)
+          ghostel_commit=$(git ls-remote https://github.com/dakra/ghostel "refs/tags/$GHOSTEL_TAG^{}" "refs/tags/$GHOSTEL_TAG" \
+            | sort -k2 -r | head -1 | cut -f1)
           [ -n "$emacs_commit" ] || { echo "Unknown Emacs tag $EMACS_TAG"; exit 1; }
           [ -n "$termux_commit" ] || { echo "Unknown Termux tag $TERMUX_TAG"; exit 1; }
+          [ -n "$ghostel_commit" ] || { echo "Unknown Ghostel tag $GHOSTEL_TAG"; exit 1; }
 
-          release_tag="$EMACS_TAG+termux-${TERMUX_TAG#v}"
+          release_tag="$EMACS_TAG+termux-${TERMUX_TAG#v}+ghostel-${GHOSTEL_TAG#v}"
           exists=false
           gh release view "$release_tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1 && exists=true
 
@@ -94,6 +107,8 @@ jobs:
             echo "emacs_commit=$emacs_commit"
             echo "termux_tag=$TERMUX_TAG"
             echo "termux_commit=$termux_commit"
+            echo "ghostel_tag=$GHOSTEL_TAG"
+            echo "ghostel_commit=$ghostel_commit"
             echo "release_tag=$release_tag"
             echo "build=$build"
             echo "release=$release"
@@ -130,6 +145,12 @@ jobs:
           git clone --depth 1 --branch "${{ needs.resolve.outputs.emacs_tag }}" \
             https://github.com/emacs-mirror/emacs emacs-src
 
+      # For its Lisp; the ghostel job builds its native module.
+      - name: Check out Ghostel
+        run: |
+          git clone --depth 1 --branch "${{ needs.resolve.outputs.ghostel_tag }}" \
+            https://github.com/dakra/ghostel ghostel-src
+
       - uses: actions/cache@v6
         with:
           path: ports/tarballs
@@ -139,6 +160,7 @@ jobs:
         env:
           EMACS_DEBUG: ${{ inputs.emacs_debug || 'false' }}
           PORTS_DIR: ${{ github.workspace }}/ports
+          GHOSTEL_SRC: ${{ github.workspace }}/ghostel-src
         run: scripts/build-emacs.sh emacs-src out
 
       - name: Upload config.log on failure
@@ -205,8 +227,51 @@ jobs:
           path: out/*.apk
           if-no-files-found: error
 
+  ghostel:
+    needs: resolve
+    if: needs.resolve.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      zig_version: ${{ steps.zig.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check out Ghostel
+        run: |
+          git clone --depth 1 --branch "${{ needs.resolve.outputs.ghostel_tag }}" \
+            https://github.com/dakra/ghostel ghostel-src
+
+      - name: Install the Android NDK
+        run: |
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$EMACS_NDK" >/dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$EMACS_NDK" >> "$GITHUB_ENV"
+
+      # Ghostel builds only with the exact Zig version its build.zig.zon
+      # names, which changes from release to release.
+      - name: Install Zig
+        id: zig
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends minisign
+          version=$(sed -n 's/^ *\.minimum_zig_version = "\(.*\)",$/\1/p' ghostel-src/build.zig.zon)
+          [ -n "$version" ] || { echo "No minimum_zig_version in Ghostel's build.zig.zon"; exit 1; }
+          scripts/install-zig.sh "$version" "$RUNNER_TEMP/zig" >> "$GITHUB_PATH"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build Ghostel's native module
+        run: scripts/build-ghostel.sh ghostel-src out
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ghostel-module
+          path: out/libghostel-module.so
+          if-no-files-found: error
+
   package:
-    needs: [resolve, emacs, termux]
+    needs: [resolve, emacs, termux, ghostel]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -219,10 +284,36 @@ jobs:
           path: unsigned
           merge-multiple: true
 
+      - uses: actions/download-artifact@v8
+        with:
+          name: ghostel-module
+          path: ghostel
+
       - name: Install build-tools
         run: |
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses >/dev/null || true
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "build-tools;$BUILD_TOOLS" >/dev/null
+
+      - name: Add Ghostel's native module to the Emacs APK
+        run: |
+          ZIPALIGN="$ANDROID_HOME/build-tools/$BUILD_TOOLS/zipalign" \
+            scripts/add-ghostel-module.sh unsigned/emacs-*.apk ghostel/libghostel-module.so
+
+      - name: Check the Emacs APK's Ghostel files
+        run: |
+          set -euo pipefail
+          apk=$(echo unsigned/emacs-*.apk)
+          unzip -l "$apk" lib/arm64-v8a/libghostel-module.so \
+            assets/etc/ghostel.tar assets/lisp/site-start.el
+          unzip -p "$apk" assets/lisp/site-start.el > "$RUNNER_TEMP/site-start.el"
+          grep -n 'defconst site-ghostel-version' "$RUNNER_TEMP/site-start.el"
+          unzip -p "$apk" assets/etc/ghostel.tar > "$RUNNER_TEMP/ghostel.tar"
+          tar tf "$RUNNER_TEMP/ghostel.tar" > "$RUNNER_TEMP/ghostel.list"
+          cat "$RUNNER_TEMP/ghostel.list"
+          for f in ./ghostel.elc ./ghostel-autoloads.el \
+                   ./etc/terminfo/x/xterm-ghostty ./etc/shell/bootstrap/zsh/.zshenv; do
+            grep -qxF "$f" "$RUNNER_TEMP/ghostel.list" || { echo "ghostel.tar lacks $f"; exit 1; }
+          done
 
       # Sign with the key that ships in the Emacs source tree, the same
       # one the SourceForge Termux builds of Emacs use, so installs of
@@ -249,17 +340,21 @@ jobs:
           EMACS_COMMIT: ${{ needs.resolve.outputs.emacs_commit }}
           TERMUX_TAG: ${{ needs.resolve.outputs.termux_tag }}
           TERMUX_COMMIT: ${{ needs.resolve.outputs.termux_commit }}
+          GHOSTEL_TAG: ${{ needs.resolve.outputs.ghostel_tag }}
+          GHOSTEL_COMMIT: ${{ needs.resolve.outputs.ghostel_commit }}
+          ZIG_VERSION: ${{ needs.ghostel.outputs.zig_version }}
         run: |
           set -euo pipefail
           cert=$(cat signed/.signing-cert-sha256)
           {
-            echo "Emacs **$EMACS_TAG** (arm64, shared user ID \`com.termux\`) and Termux **$TERMUX_TAG** (arm64, apt-android-7), both signed with Emacs's \`emacs.keystore\`."
+            echo "Emacs **$EMACS_TAG** (arm64, shared user ID \`com.termux\`, with Ghostel **$GHOSTEL_TAG**) and Termux **$TERMUX_TAG** (arm64, apt-android-7), both signed with Emacs's \`emacs.keystore\`."
             echo
             echo "Install Termux first, then Emacs."
             echo
             echo "### Sources"
             echo "- Emacs: https://github.com/emacs-mirror/emacs/tree/$EMACS_COMMIT"
             echo "- Termux: https://github.com/termux/termux-app/tree/$TERMUX_COMMIT"
+            echo "- Ghostel: https://github.com/dakra/ghostel/tree/$GHOSTEL_COMMIT (native module built with Zig $ZIG_VERSION; \`build.zig.zon\` there pins its libghostty-vt source)"
             echo "- Build scripts: https://github.com/$GITHUB_REPOSITORY/tree/$GITHUB_SHA"
             echo "- Emacs dependency ports (https://sourceforge.net/projects/android-ports-for-gnu-emacs/files/ unless linked):"
             awk 'NF { printf "  - %s (sha256 `%s`)\n", ($3 ? "[`" $2 "`](" $3 ")" : "`" $2 "`"), $1 }' ports.sha256
@@ -294,6 +389,6 @@ jobs:
             gh release delete "$TAG" --yes --cleanup-tag
           fi
           gh release create "$TAG" --target "$GITHUB_SHA" \
-            --title "Emacs ${{ needs.resolve.outputs.emacs_tag }} + Termux ${{ needs.resolve.outputs.termux_tag }}" \
+            --title "Emacs ${{ needs.resolve.outputs.emacs_tag }} + Termux ${{ needs.resolve.outputs.termux_tag }} + Ghostel ${{ needs.resolve.outputs.ghostel_tag }}" \
             --notes-file notes.md \
             signed/*.apk signed/SHA256SUMS

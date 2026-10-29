@@ -11,6 +11,9 @@
 #   MIN_SDK             minimum Android API level (default 29)
 #   EMACS_DEBUG         "true" for a debuggable build (default false)
 #   PORTS_DIR           where to unpack dependency ports (default ./ports)
+#   GHOSTEL_SRC         Ghostel source tree; when set, its Lisp is bundled
+#                       and lisp/site-start.el set up to load it (its native
+#                       module is added later by add-ghostel-module.sh)
 set -euo pipefail
 
 src=${1:?usage: build-emacs.sh EMACS_SRC_DIR OUT_DIR}
@@ -25,6 +28,8 @@ api=${ANDROID_API:-36}
 build_tools=${BUILD_TOOLS:-36.0.0}
 min_sdk=${MIN_SDK:-29}
 ports_dir=${PORTS_DIR:-$PWD/ports}
+ghostel_src=${GHOSTEL_SRC:-}
+[ -z "$ghostel_src" ] || ghostel_src=$(cd "$ghostel_src" && pwd)
 
 toolchain="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
 android_jar="$ANDROID_HOME/platforms/android-$api/android.jar"
@@ -53,6 +58,19 @@ cd "$src"
   "$debug_flag" \
   --with-ndk-path="$ndk_path" \
   --with-ndk-cxx="$android_cxx"
+
+if [ -n "$ghostel_src" ]; then
+  # The version build-ghostel.sh gives the native module.
+  ghostel_version=$(sed -n 's/^pub const version = "\(.*\)";$/\1/p' \
+                      "$ghostel_src/src/version.zig")
+  [ -n "$ghostel_version" ] || { echo "No version in $ghostel_src/src/version.zig" >&2; exit 1; }
+  sed "s/@GHOSTEL_VERSION@/$ghostel_version/" "$here/../lisp/site-start.el" \
+    > lisp/site-start.el
+  # Build the host Emacs and its Lisp first, so that it can compile
+  # Ghostel before the APK is packed.
+  make -j"$(nproc)" lisp
+  "$here/pack-ghostel.sh" "$ghostel_src" "$PWD/src/emacs" "$PWD/etc/ghostel.tar"
+fi
 
 make -j"$(nproc)" all
 
